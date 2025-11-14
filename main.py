@@ -294,6 +294,11 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
             print("PREPARING TO FINETUNE")
             print(layer)
             layer = layer.to(dtype=torch.float32)
+            print(f"inps type: {type(inps)}")
+            print(f"inps length: {len(inps)}")
+            print(f"inps[0] type: {type(inps[0])}")
+            print(f"inps[0] shape: {inps[0].shape}")
+            exit()
             with using_tf32(enabled=True):
                 layer = finetune_groupwise(
                     layer=layer,
