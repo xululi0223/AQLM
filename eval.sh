@@ -14,4 +14,5 @@ python main.py $MODEL_PATH $DATASET_PATH\
     --finetune_early_stop=3 \
     --finetune_keep_best \
     --local_batch_size=1 \
-    --offload_activations
+    --offload_activations \
+    --dtype float32

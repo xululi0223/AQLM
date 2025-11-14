@@ -137,6 +137,20 @@ def resolve_num_codebooks_for_sublayer(
     return base_num_codebooks
 
 
+def _default_exp_log_path(args: Namespace) -> str:
+    base_dir = args.save if args.save else os.getcwd()
+    return os.path.join(base_dir, "exp.log")
+
+
+def log_experiment_event(log_path: Optional[str], message: str):
+    if not log_path:
+        return
+    os.makedirs(os.path.dirname(log_path) or ".", exist_ok=True)
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    with open(log_path, "a", encoding="ascii", errors="ignore") as sink:
+        sink.write(f"[{timestamp}] {message}\n")
+
+
 def quantize_model(model: PreTrainedModel, args: Namespace):
     """main entry point to functions for model quantization"""
     tick = time.time()
@@ -282,6 +296,7 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
     use_cache = model.config.use_cache
     num_codebooks = args.num_codebooks
     model.config.use_cache = False
+    exp_log_path = _default_exp_log_path(args) if args.per_block_config_search else None
 
     quantizers = {}
     overall_bits = 0
@@ -385,6 +400,12 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     print(
                         f"Config {candidate.label()} on layer {layer_index} produced normalized MSE {candidate_mse:.6f}"
                     )
+                    log_experiment_event(
+                        exp_log_path,
+                        "candidate_result "
+                        + f"layer={layer_index} modules={';'.join(names)} config={candidate.label()} "
+                        + f"mse={candidate_mse:.6f}",
+                    )
                     if candidate_mse < best_candidate_mse:
                         best_candidate_mse = candidate_mse
                         best_modules = {name: module for name, module in candidate_replacements.items()}
@@ -397,6 +418,12 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                 stats_payload["block_config_mse"] = best_candidate_mse
                 print(
                     f"Selected config {best_config_label} for layer {layer_index} with normalized MSE {best_candidate_mse:.6f}"
+                )
+                log_experiment_event(
+                    exp_log_path,
+                    "candidate_selected "
+                    + f"layer={layer_index} modules={';'.join(names)} config={best_config_label} "
+                    + f"mse={best_candidate_mse:.6f}",
                 )
                 for sublayer_name, new_linear in best_modules.items():
                     quantized_weight = new_linear.quantized_weight
