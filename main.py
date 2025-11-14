@@ -1,6 +1,7 @@
 import os
 import time
 from argparse import Namespace
+from dataclasses import dataclass
 from itertools import chain
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple
 
@@ -32,6 +33,108 @@ try:
     has_wandb = True
 except ModuleNotFoundError:
     has_wandb = False
+
+
+@dataclass(frozen=True)
+class BlockConfig:
+    num_codebooks: int
+    nbits_per_codebook: int
+
+    def label(self) -> str:
+        return f"{self.num_codebooks}x{self.nbits_per_codebook}"
+
+
+def parse_block_config_candidates(raw: str) -> Sequence[BlockConfig]:
+    """Parse CLI string like "1x16,2x8" into BlockConfig objects."""
+    candidates = []
+    for chunk in raw.split(","):
+        token = chunk.strip().lower()
+        if not token:
+            continue
+        delimiter = "x" if "x" in token else ":"
+        parts = [part.strip() for part in token.split(delimiter) if part.strip()]
+        if len(parts) != 2:
+            raise ValueError(
+                f"Could not parse block config '{chunk}'. Use '<num_codebooks>x<nbits>' syntax, e.g. '2x8'."
+            )
+        try:
+            num_codebooks = int(parts[0])
+            nbits_per_codebook = int(parts[1])
+        except ValueError as exc:
+            raise ValueError(
+                f"Block config '{chunk}' must contain integers, got '{parts[0]}' and '{parts[1]}'."
+            ) from exc
+        if num_codebooks <= 0 or nbits_per_codebook <= 0:
+            raise ValueError(f"Block config '{chunk}' must be positive integers.")
+        candidates.append(BlockConfig(num_codebooks=num_codebooks, nbits_per_codebook=nbits_per_codebook))
+    if not candidates:
+        raise ValueError("No valid block configuration candidates were provided.")
+    return candidates
+
+
+def _get_child_module(module: nn.Module, key: str) -> nn.Module:
+    if key.isdigit() and hasattr(module, "__getitem__"):
+        return module[int(key)]
+    if hasattr(module, key):
+        return getattr(module, key)
+    if isinstance(module, nn.ModuleDict) and key in module:
+        return module[key]
+    raise AttributeError(f"Could not resolve submodule '{key}' under '{module.__class__.__name__}'.")
+
+
+def _set_child_module(module: nn.Module, key: str, value: nn.Module):
+    if key.isdigit() and hasattr(module, "__setitem__"):
+        module[int(key)] = value
+    elif isinstance(module, nn.ModuleDict) and key in module:
+        module[key] = value
+    else:
+        setattr(module, key, value)
+
+
+def _locate_parent_module(root: nn.Module, dotted_name: str) -> Tuple[nn.Module, str]:
+    parts = [part for part in dotted_name.split(".") if part]
+    parent = root
+    for part in parts[:-1]:
+        parent = _get_child_module(parent, part)
+    return parent, parts[-1]
+
+
+def apply_layer_replacements(layer: nn.Module, replacements: Dict[str, nn.Module]):
+    """Replace dotted submodule names inside layer with provided modules."""
+    for dotted_name, new_module in replacements.items():
+        parent, child_key = _locate_parent_module(layer, dotted_name)
+        _set_child_module(parent, child_key, new_module)
+
+
+def clone_activation_buffers(buffers: Sequence[torch.Tensor]) -> Sequence[torch.Tensor]:
+    return [tensor.detach().clone() for tensor in buffers]
+
+
+def evaluate_layer_mse(
+    layer: nn.Module,
+    devices: Sequence[torch.device],
+    inps: Sequence[torch.Tensor],
+    outs: Sequence[torch.Tensor],
+    forward_args: Dict[str, Any],
+) -> float:
+    cloned_outs = clone_activation_buffers(outs)
+    if len(devices) == 1:
+        assert len(inps) == len(cloned_outs) == 1
+        losses = update_outs(layer, inps[0], cloned_outs[0], compute_mse=True, **forward_args)
+    else:
+        losses = update_outs_parallel(devices, layer, inps, cloned_outs, compute_mse=True, **forward_args)
+    if not losses:
+        return float("inf")
+    return torch.mean(torch.tensor(losses)).item()
+
+
+def resolve_num_codebooks_for_sublayer(
+    base_num_codebooks: int, model: PreTrainedModel, mix_compression: bool, sublayer_name: str
+) -> int:
+    if mix_compression and "mixtral" in model.config.model_type.lower():
+        if "self_attn" in sublayer_name.lower():
+            return base_num_codebooks * 2
+    return base_num_codebooks
 
 
 def quantize_model(model: PreTrainedModel, args: Namespace):
@@ -253,40 +356,79 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     outs,
                     **forward_args,
                 )
-            for sublayer_name in aq_handlers.keys():
-                print(f"Quantizing module {sublayer_name} of layer {layer_index}")
-                if "mixtral" in model.config.model_type.lower() and args.mix_compression:
-                    assert "mixtral" in model.config.model_type.lower()
-                    if "self_attn" in sublayer_name.lower():
-                        args.num_codebooks = 2 * num_codebooks
-                    else:
-                        args.num_codebooks = num_codebooks
-                    print(sublayer_name.lower(), " mixtral num codebooks", args.num_codebooks)
-                quantized_weight = aq_handlers[sublayer_name].quantize(args=args, verbose=True)
-
-                with torch.no_grad():
-                    assert aq_handlers[sublayer_name].layer.weight in set(
-                        layer.parameters()
-                    )  # test that this is not a replica
-
+            if args.per_block_config_search:
+                base_modules = {name: aq_handlers[name].layer for name in aq_handlers}
+                best_modules: Optional[Dict[str, nn.Module]] = None
+                best_config_label: Optional[str] = None
+                best_candidate_mse = float("inf")
+                for candidate in args.block_config_candidates:
+                    candidate_args = Namespace(**vars(args))
+                    candidate_args.nbits_per_codebook = candidate.nbits_per_codebook
+                    base_candidate_num_codebooks = candidate.num_codebooks
+                    candidate_replacements: Dict[str, nn.Module] = {}
+                    print(
+                        f"Evaluating config {candidate.label()} for layer {layer_index} ({', '.join(names)})"
+                    )
+                    for sublayer_name in aq_handlers.keys():
+                        effective_num_codebooks = resolve_num_codebooks_for_sublayer(
+                            base_candidate_num_codebooks, model, args.mix_compression, sublayer_name
+                        )
+                        candidate_args.num_codebooks = effective_num_codebooks
+                        quantized_weight = aq_handlers[sublayer_name].quantize(args=candidate_args, verbose=True)
+                        new_linear = QuantizedLinear(quantized_weight, aq_handlers[sublayer_name].layer.bias)
+                        if args.use_checkpointing:
+                            new_linear.use_checkpoint = True
+                            print("ENABLED CHECKPOINTING FOR", sublayer_name)
+                        candidate_replacements[sublayer_name] = new_linear
+                    apply_layer_replacements(layer, candidate_replacements)
+                    candidate_mse = evaluate_layer_mse(layer, args.devices, inps, outs, forward_args)
+                    print(
+                        f"Config {candidate.label()} on layer {layer_index} produced normalized MSE {candidate_mse:.6f}"
+                    )
+                    if candidate_mse < best_candidate_mse:
+                        best_candidate_mse = candidate_mse
+                        best_modules = {name: module for name, module in candidate_replacements.items()}
+                        best_config_label = candidate.label()
+                    apply_layer_replacements(layer, base_modules)
+                if best_modules is None:
+                    raise RuntimeError("Per-block config search did not produce any candidate modules.")
+                apply_layer_replacements(layer, best_modules)
+                stats_payload["block_config"] = best_config_label
+                stats_payload["block_config_mse"] = best_candidate_mse
+                print(
+                    f"Selected config {best_config_label} for layer {layer_index} with normalized MSE {best_candidate_mse:.6f}"
+                )
+                for sublayer_name, new_linear in best_modules.items():
+                    quantized_weight = new_linear.quantized_weight
+                    weight_avg_bits = quantized_weight.estimate_nbits_per_parameter()
+                    overall_bits += int(weight_avg_bits * torch.numel(aq_handlers[sublayer_name].layer.weight.data))
+                    number_of_quantized_params += torch.numel(aq_handlers[sublayer_name].layer.weight.data)
+                    quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()
+                print("curent_avg_bits", overall_bits / number_of_quantized_params)
+            else:
+                replacements: Dict[str, nn.Module] = {}
+                base_num_codebooks_for_layer = args.num_codebooks
+                for sublayer_name in aq_handlers.keys():
+                    print(f"Quantizing module {sublayer_name} of layer {layer_index}")
+                    effective_num_codebooks = resolve_num_codebooks_for_sublayer(
+                        base_num_codebooks_for_layer, model, args.mix_compression, sublayer_name
+                    )
+                    args.num_codebooks = effective_num_codebooks
+                    if effective_num_codebooks != base_num_codebooks_for_layer:
+                        print(sublayer_name.lower(), " mixtral num codebooks", args.num_codebooks)
+                    quantized_weight = aq_handlers[sublayer_name].quantize(args=args, verbose=True)
                     new_linear = QuantizedLinear(quantized_weight, aq_handlers[sublayer_name].layer.bias)
                     if args.use_checkpointing:
                         new_linear.use_checkpoint = True
                         print("ENABLED CHECKPOINTING FOR", sublayer_name)
-                    found_original = False
-                    for submodule in layer.modules():
-                        for child_name, child_module in submodule.named_children():
-                            if child_module is aq_handlers[sublayer_name].layer:
-                                setattr(submodule, child_name, new_linear)
-                                found_original = True  # note: do not break to handle tied layers
-
-                    assert found_original, f"could not find {sublayer_name}"
-
-                weight_avg_bits = quantized_weight.estimate_nbits_per_parameter()
-                overall_bits += int(weight_avg_bits * torch.numel(aq_handlers[sublayer_name].layer.weight.data))
-                number_of_quantized_params += torch.numel(aq_handlers[sublayer_name].layer.weight.data)
-                print("curent_avg_bits", overall_bits / number_of_quantized_params)
-                quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()  # to be updated
+                    replacements[sublayer_name] = new_linear
+                    weight_avg_bits = quantized_weight.estimate_nbits_per_parameter()
+                    overall_bits += int(weight_avg_bits * torch.numel(aq_handlers[sublayer_name].layer.weight.data))
+                    number_of_quantized_params += torch.numel(aq_handlers[sublayer_name].layer.weight.data)
+                    print("curent_avg_bits", overall_bits / number_of_quantized_params)
+                    quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()
+                args.num_codebooks = base_num_codebooks_for_layer
+                apply_layer_replacements(layer, replacements)
 
             del aq_handlers
             assert not loaded_layer
@@ -715,6 +857,19 @@ def main():
         default=1,
         help="Split codebook vectors into this many groups for quantizations. Only used when quantized codebooks.",
     )
+    parser.add_argument(
+        "--per_block_config_search",
+        action="store_true",
+        help="Try multiple (num_codebooks, nbits_per_codebook) settings per transformer block and pick the one with"
+        " the lowest activation MSE.",
+    )
+    parser.add_argument(
+        "--block_config_candidates",
+        type=str,
+        default=None,
+        help="Comma-separated list of '<num_codebooks>x<nbits>' pairs, e.g. '1x16,2x8'. Used when"
+        " --per_block_config_search is enabled.",
+    )
 
     parser.add_argument(
         "--init_max_iter",
@@ -849,6 +1004,15 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
+    if args.per_block_config_search:
+        if not args.block_config_candidates:
+            parser.error("--per_block_config_search requires --block_config_candidates to be set.")
+        try:
+            args.block_config_candidates = parse_block_config_candidates(args.block_config_candidates)
+        except ValueError as exc:
+            parser.error(str(exc))
+    else:
+        args.block_config_candidates = [BlockConfig(args.num_codebooks, args.nbits_per_codebook)]
     if args.devices is None:
         if torch.cuda.is_available():
             args.devices = [torch.device(f"cuda:{i}") for i in range(torch.cuda.device_count())]
