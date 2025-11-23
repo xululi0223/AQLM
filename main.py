@@ -296,7 +296,9 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
     use_cache = model.config.use_cache
     num_codebooks = args.num_codebooks
     model.config.use_cache = False
-    exp_log_path = _default_exp_log_path(args) if args.per_block_config_search else None
+    exp_log_path = (
+        _default_exp_log_path(args) if (args.per_block_config_search or args.per_layer_config_search) else None
+    )
 
     quantizers = {}
     overall_bits = 0
@@ -424,6 +426,75 @@ def quantize_aq(model: PreTrainedModel, data: Sequence, val_data: Optional[Seque
                     "candidate_selected "
                     + f"layer={layer_index} modules={';'.join(names)} config={best_config_label} "
                     + f"mse={best_candidate_mse:.6f}",
+                )
+                for sublayer_name, new_linear in best_modules.items():
+                    quantized_weight = new_linear.quantized_weight
+                    weight_avg_bits = quantized_weight.estimate_nbits_per_parameter()
+                    overall_bits += int(weight_avg_bits * torch.numel(aq_handlers[sublayer_name].layer.weight.data))
+                    number_of_quantized_params += torch.numel(aq_handlers[sublayer_name].layer.weight.data)
+                    quantizers["model.layers.%d.%s" % (layer_index, sublayer_name)] = ()
+                print("curent_avg_bits", overall_bits / number_of_quantized_params)
+            elif args.per_layer_config_search:
+                base_modules = {name: aq_handlers[name].layer for name in aq_handlers}
+                best_modules: Dict[str, nn.Module] = {}
+                sublayer_configs: Dict[str, str] = {}
+                for sublayer_name in aq_handlers.keys():
+                    print(f"\n--- Searching config for sublayer {sublayer_name} in layer {layer_index} ---")
+                    best_sublayer_module: Optional[nn.Module] = None
+                    best_sublayer_config_label: Optional[str] = None
+                    best_sublayer_mse = float("inf")
+                    for candidate in args.block_config_candidates:
+                        candidate_args = Namespace(**vars(args))
+                        candidate_args.nbits_per_codebook = candidate.nbits_per_codebook
+                        base_candidate_num_codebooks = candidate.num_codebooks
+                        effective_num_codebooks = resolve_num_codebooks_for_sublayer(
+                            base_candidate_num_codebooks, model, args.mix_compression, sublayer_name
+                        )
+                        candidate_args.num_codebooks = effective_num_codebooks
+                        print(
+                            f"  Evaluating config {candidate.label()} for sublayer {sublayer_name} "
+                            f"(effective_num_codebooks={effective_num_codebooks})"
+                        )
+                        quantized_weight = aq_handlers[sublayer_name].quantize(args=candidate_args, verbose=True)
+                        new_linear = QuantizedLinear(quantized_weight, aq_handlers[sublayer_name].layer.bias)
+                        if args.use_checkpointing:
+                            new_linear.use_checkpoint = True
+                            print("  ENABLED CHECKPOINTING FOR", sublayer_name)
+                        apply_layer_replacements(layer, {sublayer_name: new_linear})
+                        candidate_mse = evaluate_layer_mse(layer, args.devices, inps, outs, forward_args)
+                        print(
+                            f"  Config {candidate.label()} for sublayer {sublayer_name} "
+                            f"produced normalized MSE {candidate_mse:.6f}"
+                        )
+                        log_experiment_event(
+                            exp_log_path,
+                            "sublayer_candidate_result "
+                            + f"layer={layer_index} sublayer={sublayer_name} config={candidate.label()} "
+                            + f"mse={candidate_mse:.6f}",
+                        )
+                        if candidate_mse < best_sublayer_mse:
+                            best_sublayer_mse = candidate_mse
+                            best_sublayer_module = new_linear
+                            best_sublayer_config_label = candidate.label()
+                        apply_layer_replacements(layer, {sublayer_name: base_modules[sublayer_name]})
+                    if best_sublayer_module is None:
+                        raise RuntimeError(f"Per-layer config search failed for sublayer {sublayer_name}.")
+                    best_modules[sublayer_name] = best_sublayer_module
+                    sublayer_configs[sublayer_name] = best_sublayer_config_label
+                    print(
+                        f"  Selected config {best_sublayer_config_label} for sublayer {sublayer_name} "
+                        f"with MSE {best_sublayer_mse:.6f}"
+                    )
+                    log_experiment_event(
+                        exp_log_path,
+                        "sublayer_candidate_selected "
+                        + f"layer={layer_index} sublayer={sublayer_name} config={best_sublayer_config_label} "
+                        + f"mse={best_sublayer_mse:.6f}",
+                    )
+                apply_layer_replacements(layer, best_modules)
+                stats_payload["layer_configs"] = sublayer_configs
+                print(
+                    f"\nSelected per-layer configs for layer {layer_index}: {sublayer_configs}"
                 )
                 for sublayer_name, new_linear in best_modules.items():
                     quantized_weight = new_linear.quantized_weight
@@ -891,11 +962,17 @@ def main():
         " the lowest activation MSE.",
     )
     parser.add_argument(
+        "--per_layer_config_search",
+        action="store_true",
+        help="Try multiple (num_codebooks, nbits_per_codebook) settings per sublayer (finer granularity than block) "
+        "and pick the best config for each sublayer independently based on activation MSE.",
+    )
+    parser.add_argument(
         "--block_config_candidates",
         type=str,
         default=None,
         help="Comma-separated list of '<num_codebooks>x<nbits>' pairs, e.g. '1x16,2x8'. Used when"
-        " --per_block_config_search is enabled.",
+        " --per_block_config_search or --per_layer_config_search is enabled.",
     )
 
     parser.add_argument(
@@ -1031,9 +1108,13 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     args = parser.parse_args()
-    if args.per_block_config_search:
+    if args.per_block_config_search and args.per_layer_config_search:
+        parser.error("Cannot use both --per_block_config_search and --per_layer_config_search simultaneously.")
+    if args.per_block_config_search or args.per_layer_config_search:
         if not args.block_config_candidates:
-            parser.error("--per_block_config_search requires --block_config_candidates to be set.")
+            parser.error(
+                "--per_block_config_search or --per_layer_config_search requires --block_config_candidates to be set."
+            )
         try:
             args.block_config_candidates = parse_block_config_candidates(args.block_config_candidates)
         except ValueError as exc:

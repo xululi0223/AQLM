@@ -235,9 +235,12 @@ Main CLI arguments:
 - `--num_codebooks` - number of codebooks per layer
 - `--nbits_per_codebook` - each codebook will contain 2 ** nbits_per_codebook vectors
 - `--per_block_config_search` + `--block_config_candidates` - enable MSE-driven search over multiple codebook
-    configurations (specified as `<num_codebooks>x<nbits>` pairs, e.g. `--block_config_candidates 1x16,2x8`).
-    When active, each transformer block is quantized with every candidate and the variant with the lowest
-    activation MSE is kept.
+  configurations (specified as `<num_codebooks>x<nbits>` pairs, e.g. `--block_config_candidates 1x16,2x8`).
+  When active, each transformer block is quantized with every candidate and the variant with the lowest
+  activation MSE is kept.
+- `--per_layer_config_search` + `--block_config_candidates` - enable finer-grained MSE-driven search that independently
+  selects the best codebook configuration for each sublayer (e.g., q_proj, k_proj, etc.) within a transformer block,
+  rather than using a single configuration for the entire block. Results are logged per sublayer in `exp.log`.
 - `--in_group_size` - how many weights are quantized together (aka "g" in the arXiv paper)
 - `--finetune_batch_size` - (for fine-tuning only) the total number of sequences used for each optimization step
 - `--local_batch_size` - when accumulating finetune_batch_size, process this many samples per GPU per forward pass (affects GPU RAM usage)
