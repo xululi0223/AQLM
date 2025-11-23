@@ -1,4 +1,4 @@
-export CUDA_VISIBLE_DEVICES=0
+export CUDA_VISIBLE_DEVICES=4
 export MODEL_PATH=meta-llama/Llama-2-7b-hf
 export DATASET_PATH=c4
 
@@ -15,4 +15,6 @@ python main.py $MODEL_PATH $DATASET_PATH\
     --finetune_keep_best \
     --local_batch_size=1 \
     --offload_activations \
-    --dtype float32
+    --dtype float32 \
+    --per_block_config_search \
+    --block_config_candidates 1x16,2x8,4x4,8x2,16x1
